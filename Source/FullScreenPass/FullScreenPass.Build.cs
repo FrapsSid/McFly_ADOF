@@ -1,55 +1,47 @@
-// Copyright Epic Games, Inc. All Rights Reserved.
+// FullScreenPass.Build.cs
 
 using UnrealBuildTool;
+using System.IO;
 
 public class FullScreenPass : ModuleRules
 {
-	public FullScreenPass(ReadOnlyTargetRules Target) : base(Target)
-	{
-		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
-		
-		PublicIncludePaths.AddRange(
-			new string[] {
-				// ... add public include paths required here ...
-			}
-			);
-				
-		
-		PrivateIncludePaths.AddRange(
-			new string[] {
-				// ... add other private include paths required here ...
-			}
-			);
-			
-		
-		PublicDependencyModuleNames.AddRange(
-			new string[]
-			{
-				"Core",
-				// ... add other public dependencies that you statically link with here ...
-			}
-			);
-			
-		
-		PrivateDependencyModuleNames.AddRange(
-			new string[]
-			{
-				"Core",
-				"CoreUObject",
-				"Engine",
-				"RHI",
-				"Renderer",
-				"Projects",
-				"RenderCore",
-			}
-			);
-		
-		
-		DynamicallyLoadedModuleNames.AddRange(
-			new string[]
-			{
-				// ... add any modules that your module loads dynamically here ...
-			}
-			);
-	}
+    public FullScreenPass(ReadOnlyTargetRules Target) : base(Target)
+    {
+        PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
+
+        PublicDependencyModuleNames.AddRange(
+            new string[]
+            {
+                "Core",
+            }
+        );
+            
+        PrivateDependencyModuleNames.AddRange(
+            new string[]
+            {
+                "CoreUObject",
+                "Engine",
+                "RHI",
+                "RenderCore",
+                "Renderer",
+                "Projects",
+            }
+        );
+
+        PrivateIncludePathModuleNames.AddRange(
+            new string[]
+            {
+                "Renderer",
+            }
+        );
+
+        string PluginPath = Path.GetFullPath(Path.Combine(ModuleDirectory, "../../"));
+        string ShaderPath = Path.Combine(PluginPath, "Shaders");
+        
+        if (Directory.Exists(ShaderPath))
+        {
+            RuntimeDependencies.Add(Path.Combine(ShaderPath, "*.usf"));
+            RuntimeDependencies.Add(Path.Combine(ShaderPath, "*.ush"));
+        }
+    }
 }
