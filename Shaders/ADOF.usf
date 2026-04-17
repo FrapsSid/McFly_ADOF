@@ -1,4 +1,4 @@
-// ADOF.usf
+// ADOF.usf - Optimized
 // Advanced Depth of Field - Ported from ReShade to Unreal Engine USF
 
 #include "/Engine/Private/Common.ush"
@@ -26,6 +26,8 @@
 #define FPS_HAND_BLUR_CUTOFF_DIST               0.3353
 #define FPS_HAND_BLUR_CUTOFF_CHECK              0
 #define GAUSSIAN_BUILDUP_MULT                   4.0
+#define MAX_GAUSSIAN_STEPS                      50
+#define COC_SKIP_THRESHOLD                      0.001
 
 //=============================================================================
 // Parameters (bound from C++)
@@ -34,11 +36,9 @@
 float4 ADOF_BufferSizeAndInvSize;
 float4 ADOF_ViewSizeAndInvSize;
 
-// Scene color - passed explicitly
 Texture2D ADOF_SceneColorTexture;
 SamplerState ADOF_SceneColorSampler;
 
-// Depth texture - passed explicitly (renamed to avoid conflict with engine)
 Texture2D ADOF_DepthTexture;
 SamplerState ADOF_DepthSampler;
 
@@ -83,7 +83,7 @@ SamplerState ADOF_CommonSampler1;
 
 float GetAspectRatio()
 {
-    return ADOF_BufferSizeAndInvSize.x / ADOF_BufferSizeAndInvSize.y;
+    return ADOF_BufferSizeAndInvSize.x * ADOF_BufferSizeAndInvSize.w;
 }
 
 float2 GetPixelSize()
@@ -91,84 +91,72 @@ float2 GetPixelSize()
     return ADOF_BufferSizeAndInvSize.zw;
 }
 
-// Get linear depth from depth texture
 float GetLinearDepth(float2 UV)
 {
-    float DeviceZ = ADOF_DepthTexture.SampleLevel(ADOF_DepthSampler, UV, 0).r;
-    
-    // For fallback white texture, this will return far depth
-    // For actual depth, convert from device Z to linear
-    // Simple linear conversion (adjust based on your needs)
-    return saturate(DeviceZ);
+    return saturate(ADOF_DepthTexture.SampleLevel(ADOF_DepthSampler, UV, 0).r);
 }
 
 float4 GetSceneColor(float2 UV)
 {
-    float3 Color = ADOF_SceneColorTexture.SampleLevel(ADOF_SceneColorSampler, UV, 0).rgb;
-    return float4(Color, 1.0);
+    return float4(ADOF_SceneColorTexture.SampleLevel(ADOF_SceneColorSampler, UV, 0).rgb, 1.0);
 }
 
 float CircleOfConfusion(float2 TexCoord, bool AggressiveLeakReduction)
 {
-    float2 DepthData;
-    float SceneCoC;
     float2 PixelSize = GetPixelSize();
-    
-    DepthData.x = GetLinearDepth(TexCoord);
-    
+    float DepthCenter = GetLinearDepth(TexCoord);
+
     [branch]
     if (AggressiveLeakReduction)
     {
-        float3 NeighbourOffsets = float3(PixelSize, 0);
-        float4 NeighbourDepths = float4(
-            GetLinearDepth(TexCoord - NeighbourOffsets.xz),
-            GetLinearDepth(TexCoord + NeighbourOffsets.xz),
-            GetLinearDepth(TexCoord - NeighbourOffsets.zy),
-            GetLinearDepth(TexCoord + NeighbourOffsets.zy)
+        float2 Ox = float2(PixelSize.x, 0);
+        float2 Oy = float2(0, PixelSize.y);
+        float NeighbourMin = min(
+            min(GetLinearDepth(TexCoord - Ox), GetLinearDepth(TexCoord + Ox)),
+            min(GetLinearDepth(TexCoord - Oy), GetLinearDepth(TexCoord + Oy))
         );
-        
-        float NeighbourMin = min(min(NeighbourDepths.x, NeighbourDepths.y), min(NeighbourDepths.z, NeighbourDepths.w));
-        DepthData.x = lerp(min(NeighbourMin, DepthData.x), DepthData.x, 0.001);
+        DepthCenter = lerp(min(NeighbourMin, DepthCenter), DepthCenter, 0.001);
     }
-    
-    DepthData.y = ADOF_FocusTexture.SampleLevel(ADOF_FocusSampler, float2(0.5, 0.5), 0).x;
-    float HandDepth = DepthData.x;
-    
-    DepthData.xy = saturate(DepthData.xy / fADOF_HyperFocus);
-    
+
+    float FocusDepth = ADOF_FocusTexture.SampleLevel(ADOF_FocusSampler, float2(0.5, 0.5), 0).x;
+    float HandDepth = DepthCenter;
+
+    float DepthNorm = saturate(DepthCenter / fADOF_HyperFocus);
+    float FocusNorm = saturate(FocusDepth / fADOF_HyperFocus);
+
+    float SceneCoC;
     [branch]
-    if (DepthData.x < DepthData.y)
+    if (DepthNorm < FocusNorm)
     {
-        SceneCoC = DepthData.x / max(DepthData.y, 0.0001) - 1.0;
+        SceneCoC = DepthNorm / max(FocusNorm, 0.0001) - 1.0;
         SceneCoC *= exp2(-0.5 * fADOF_NearBlurCurve * fADOF_NearBlurCurve);
     }
     else
     {
         float FarBlurMult = exp2(fADOF_FarBlurCurve * fADOF_FarBlurCurve);
-        float Denom = max((DepthData.y * FarBlurMult) - DepthData.y, 0.0001);
-        SceneCoC = (DepthData.x - DepthData.y) / Denom;
-        SceneCoC = saturate(SceneCoC);
+        SceneCoC = saturate((DepthNorm - FocusNorm) / max(FocusNorm * FarBlurMult - FocusNorm, 0.0001));
     }
-    
+
 #if FPS_HAND_BLUR_CUTOFF_CHECK
     SceneCoC = (HandDepth < FPS_HAND_BLUR_CUTOFF_DIST * 1e-4) ? 0.0 : 1.0;
 #else
     SceneCoC = (HandDepth < FPS_HAND_BLUR_CUTOFF_DIST * 1e-4) ? 0.0 : SceneCoC;
 #endif
-    
+
     return SceneCoC;
 }
 
 void ShapeRoundness(inout float2 SampleOffset, float Roundness)
 {
-    float Len = sqrt(dot(SampleOffset, SampleOffset) + 0.0001);
-    SampleOffset *= (1.0 - Roundness) + rsqrt(Len + 0.0001) * Roundness;
+    float LenSq = dot(SampleOffset, SampleOffset) + 0.0001;
+    float InvLen = rsqrt(LenSq);
+    SampleOffset *= (1.0 - Roundness) + InvLen * Roundness;
 }
 
 void OpticalVignette(float2 SampleOffset, float2 CenterVec, inout float SampleWeight)
 {
-    SampleOffset -= CenterVec;
-    SampleWeight *= saturate(3.333 - dot(SampleOffset, SampleOffset) * 1.666);
+    float2 Diff = SampleOffset - CenterVec;
+    SampleWeight *= saturate(3.333 - dot(Diff, Diff) * 1.666);
 }
 
 float2 CoC2BlurRadius(float CoC)
@@ -201,16 +189,13 @@ void VS_ADOF(
     OutTexCoord.y = (VertexID == 1) ? 2.0 : 0.0;
     OutTexCoord.zw = OutTexCoord.xy / max(fADOF_RenderResolutionMult, 0.01);
     OutPosition = float4(OutTexCoord.xy * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
-    
-    float SinVal, CosVal;
+
     int SafeVertices = max(iADOF_ShapeVertices, 3);
-    sincos(6.2831853 / (float)SafeVertices, SinVal, CosVal);
-    OutOffsMat._11 = CosVal;
-    OutOffsMat._12 = -SinVal;
-    OutOffsMat._21 = SinVal;
-    OutOffsMat._22 = CosVal;
-    
-    // Convert degrees to radians
+    float Angle = 6.2831853 / (float)SafeVertices;
+    float SinVal, CosVal;
+    sincos(Angle, SinVal, CosVal);
+    OutOffsMat = float2x2(CosVal, -SinVal, SinVal, CosVal);
+
     sincos(fADOF_ShapeRotation * 0.0174533, OutOffset0.x, OutOffset0.y);
     OutOffset0.zw = mul(OutOffset0.xy, OutOffsMat);
 }
@@ -227,28 +212,31 @@ void PS_ReadFocus(
     out float OutFocus : SV_Target0)
 {
     float SceneFocus = 0.0;
-    
+
     [branch]
     if (bADOF_AutofocusEnable > 0.5)
     {
-        float Samples = 10.0;
+        static const float Samples = 7.0;
         float WeightSum = 1e-6;
-        
-        for (float XCoord = 0.0; XCoord < Samples; XCoord++)
+        float RcpSamples = rcp(Samples);
+        float CutoffThreshold = FPS_HAND_BLUR_CUTOFF_DIST * 1e-4;
+        float2 AFCenter = fADOF_AutofocusCenter - 0.5;
+
+        for (float Y = 0.0; Y < Samples; Y++)
         {
-            for (float YCoord = 0.0; YCoord < Samples; YCoord++)
+            for (float X = 0.0; X < Samples; X++)
             {
-                float2 SampleOffset = (float2(XCoord, YCoord) + 0.5) / Samples;
+                float2 SampleOffset = (float2(X, Y) + 0.5) * RcpSamples;
                 SampleOffset = SampleOffset * 2.0 - 1.0;
                 SampleOffset *= fADOF_AutofocusRadius;
-                SampleOffset += (fADOF_AutofocusCenter - 0.5);
-                
+                SampleOffset += AFCenter;
+
                 float SampleWeight = saturate(1.2 * exp2(-dot(SampleOffset, SampleOffset) * 4.0));
-                
+
                 float TempFocus = GetLinearDepth(SampleOffset * 0.5 + 0.5);
                 SampleWeight *= rcp(TempFocus + 0.001);
-                SampleWeight *= saturate(TempFocus > FPS_HAND_BLUR_CUTOFF_DIST * 1e-4 ? 1.0 : 0.0);
-                
+                SampleWeight *= (TempFocus > CutoffThreshold) ? 1.0 : 0.0;
+
                 SceneFocus += TempFocus * SampleWeight;
                 WeightSum += SampleWeight;
             }
@@ -259,11 +247,11 @@ void PS_ReadFocus(
     {
         SceneFocus = fADOF_ManualfocusDepth * fADOF_ManualfocusDepth;
     }
-    
+
     float PrevSceneFocus = ADOF_FocusTexturePrev.SampleLevel(ADOF_FocusPrevSampler, float2(0.5, 0.5), 0).x;
     float AdjustmentSpeed = fADOF_AutofocusSpeed * fADOF_AutofocusSpeed;
-    AdjustmentSpeed *= PrevSceneFocus > SceneFocus ? 2.0 : 1.0;
-    
+    AdjustmentSpeed *= (PrevSceneFocus > SceneFocus) ? 2.0 : 1.0;
+
     OutFocus = lerp(PrevSceneFocus, SceneFocus, saturate(AdjustmentSpeed));
 }
 
@@ -294,49 +282,42 @@ void PS_CoC(
 {
     float2 PixelSize = GetPixelSize();
     float4 Color = GetSceneColor(TexCoord.xy);
-    
-    float2 SampleOffsets[4] = {
-        float2(1.5, 0.5) * PixelSize,
-        float2(0.5, -1.5) * PixelSize,
-        float2(-1.5, -0.5) * PixelSize,
-        float2(-0.5, 1.5) * PixelSize
-    };
-    
+
     float CenterDepth = GetLinearDepth(TexCoord.xy);
-    float4 SampleCoord = 0.0;
-    float3 NeighbourOffsets = float3(PixelSize, 0);
+    float RcpCenterDepth = rcp(CenterDepth + 0.0001);
+
+    static const float2 SampleOffsets[4] = {
+        float2( 1.5,  0.5),
+        float2( 0.5, -1.5),
+        float2(-1.5, -0.5),
+        float2(-0.5,  1.5)
+    };
+
     float4 CoCColor = 0.0;
-    
-    [loop]
+
+    [unroll]
     for (int i = 0; i < 4; i++)
     {
-        SampleCoord.xy = TexCoord.xy + SampleOffsets[i];
-        
-        float3 SampleColor = GetSceneColor(SampleCoord.xy).rgb;
-        
-        float4 SampleDepths = float4(
-            GetLinearDepth(SampleCoord.xy + NeighbourOffsets.xz),
-            GetLinearDepth(SampleCoord.xy - NeighbourOffsets.xz),
-            GetLinearDepth(SampleCoord.xy + NeighbourOffsets.zy),
-            GetLinearDepth(SampleCoord.xy - NeighbourOffsets.zy)
-        );
-        
-        float SampleDepthMin = min(min(SampleDepths.x, SampleDepths.y), min(SampleDepths.z, SampleDepths.w));
-        
+        float2 SampleUV = TexCoord.xy + SampleOffsets[i] * PixelSize;
+
+        float3 SampleColor = GetSceneColor(SampleUV).rgb;
+
+        float SampleDepth = GetLinearDepth(SampleUV);
+
         SampleColor /= 1.0 + max(max(SampleColor.r, SampleColor.g), SampleColor.b);
-        
-        float SampleWeight = saturate(SampleDepthMin * rcp(CenterDepth + 0.0001) + 1e-3);
-        CoCColor += float4(SampleColor.rgb * SampleWeight, SampleWeight);
+
+        float SampleWeight = saturate(SampleDepth * RcpCenterDepth + 1e-3);
+        CoCColor += float4(SampleColor * SampleWeight, SampleWeight);
     }
-    
+
     CoCColor.rgb /= max(CoCColor.a, 0.0001);
     float MaxChannel = max(CoCColor.r, max(CoCColor.g, CoCColor.b));
     CoCColor.rgb /= max(1.0 - MaxChannel, 0.0001);
-    
+
     Color.rgb = lerp(Color.rgb, CoCColor.rgb, saturate(CoCColor.w * 8.0));
     Color.w = CircleOfConfusion(TexCoord.xy, true);
     Color.w = saturate(Color.w * 0.5 + 0.5);
-    
+
     OutColor = Color;
 }
 
@@ -356,95 +337,104 @@ void PS_DoF_Main(
         OutColor = 0;
         return;
     }
-    
+
     float2 PixelSize = GetPixelSize();
-    
-    float4 BokehSum, BokehMax;
-    BokehMax = ADOF_CommonTexture0.Sample(ADOF_CommonSampler0, TexCoord.zw);
-    BokehSum = BokehMax;
+
+    float4 BokehMax = ADOF_CommonTexture0.SampleLevel(ADOF_CommonSampler0, TexCoord.zw, 0);
+    float4 BokehSum = BokehMax;
     float WeightSum = 1.0;
     float CoC = abs(BokehSum.w * 2.0 - 1.0);
+
+    // Early-out for negligible blur
     float2 BokehRadiusScaled = CoC2BlurRadius(CoC);
-    float NRings = lerp(1.0, (float)iADOF_ShapeQuality, saturate(CoC)) + fmod(dot(Position.xy, 1), 2) * 0.5;
-    
-    if (BokehRadiusScaled.x < DISCRADIUS_RESOLUTION_BOUNDARY_LOWER * PixelSize.x)
+    if (BokehRadiusScaled.x < DISCRADIUS_RESOLUTION_BOUNDARY_LOWER * PixelSize.x || CoC < COC_SKIP_THRESHOLD)
     {
         OutColor = BokehSum;
         return;
     }
-    
-    BokehRadiusScaled /= max(NRings, 0.001);
-    CoC /= max(NRings, 0.001);
-    
+
+    float NRings = lerp(1.0, (float)iADOF_ShapeQuality, saturate(CoC)) + fmod(dot(Position.xy, 1), 2) * 0.5;
+    float RcpNRings = rcp(max(NRings, 0.001));
+
+    BokehRadiusScaled *= RcpNRings;
+    float CoCScaled = CoC * RcpNRings;
+
+    int DensityScale = max(1, 6 - iADOF_ShapeVertices);
+    int SafeVertices = min(iADOF_ShapeVertices, 10);
+
+    // Precompute curvature constant
+    float VertSq = max((float)(iADOF_ShapeVertices * iADOF_ShapeVertices) * 0.4 - 1.0, 0.0001);
+    float CurvL = 2.55 * rcp(VertSq);
+
 #if ADOF_OPTICAL_VIGNETTE_ENABLE
     float2 CenterVec = TexCoord.zw - 0.5;
-    float CenterDist = sqrt(dot(CenterVec, CenterVec));
+    float CenterDist = length(CenterVec);
     float Vignette = pow(max(CenterDist, 0.0001), fADOF_ShapeVignetteCurve) * fADOF_ShapeVignetteAmount;
     CenterVec = CenterVec / max(CenterDist, 0.0001) * Vignette;
-    WeightSum *= saturate(3.33 - Vignette * 2.0);
-    BokehSum *= WeightSum;
-    BokehMax *= WeightSum;
+    float VignetteWeight = saturate(3.33 - Vignette * 2.0);
+    WeightSum *= VignetteWeight;
+    BokehSum *= VignetteWeight;
+    BokehMax *= VignetteWeight;
 #endif
-    
-    int DensityScale = max(1, 6 - iADOF_ShapeVertices);
-    
+
     float4 CurrentOffset0 = Offset0;
-    float2x2 CurrentOffsMat = OffsMat;
-    
+
     [loop]
-    for (int iVertices = 0; iVertices < iADOF_ShapeVertices && iVertices < 10; iVertices++)
+    for (int iVertices = 0; iVertices < SafeVertices; iVertices++)
     {
         [loop]
         for (float iRings = 1; iRings <= NRings && iRings < 26; iRings++)
         {
+            int SamplesThisRing = (int)(iRings) * DensityScale;
+            float RcpRingDensity = rcp(max((float)SamplesThisRing, 0.001));
+            float2 RadiusThisRing = BokehRadiusScaled * iRings;
+            float CoCThisRing = CoCScaled * iRings;
+
             [loop]
-            for (float iSamplesPerRing = 0; iSamplesPerRing < iRings * DensityScale && iSamplesPerRing < 26 * 2; iSamplesPerRing++)
+            for (int iSample = 0; iSample < SamplesThisRing && iSample < 52; iSample++)
             {
-                float RingDensity = max(iRings * DensityScale, 0.001);
-                float X = iSamplesPerRing / RingDensity;
+                float X = (float)iSample * RcpRingDensity;
                 float A = X * X * (3.0 - 2.0 * X);
-                float VertSq = max(iADOF_ShapeVertices * iADOF_ShapeVertices * 0.4 - 1.0, 0.0001);
-                float L = 2.55 * rcp(VertSq);
-                X = lerp(X, (1.0 + L) * X - A * L, fADOF_ShapeCurvatureAmount);
-                
+                X = lerp(X, (1.0 + CurvL) * X - A * CurvL, fADOF_ShapeCurvatureAmount);
+
                 float2 SampleOffset = lerp(CurrentOffset0.xy, CurrentOffset0.zw, X);
-                
                 ShapeRoundness(SampleOffset, fADOF_ShapeCurvatureAmount);
-                
-                float4 SampleBokeh = ADOF_CommonTexture0.SampleLevel(ADOF_CommonSampler0, TexCoord.zw + SampleOffset.xy * (BokehRadiusScaled * iRings), 0);
-                float SampleWeight = saturate(1e6 * (abs(SampleBokeh.a * 2.0 - 1.0) - CoC * iRings) + 1.0);
-                
+
+                float4 SampleBokeh = ADOF_CommonTexture0.SampleLevel(ADOF_CommonSampler0, TexCoord.zw + SampleOffset * RadiusThisRing, 0);
+                float SampleWeight = saturate(1e6 * (abs(SampleBokeh.a * 2.0 - 1.0) - CoCThisRing) + 1.0);
+
 #if ADOF_OPTICAL_VIGNETTE_ENABLE
-                OpticalVignette(SampleOffset.xy * iRings / max(NRings, 0.001), CenterVec, SampleWeight);
+                OpticalVignette(SampleOffset * iRings * RcpNRings, CenterVec, SampleWeight);
 #endif
-                
+
                 SampleBokeh.rgb *= SampleWeight;
                 WeightSum += SampleWeight;
                 BokehSum += SampleBokeh;
                 BokehMax = max(BokehMax, SampleBokeh);
             }
         }
-        
+
         CurrentOffset0.xy = CurrentOffset0.zw;
-        CurrentOffset0.zw = mul(CurrentOffset0.zw, CurrentOffsMat);
+        CurrentOffset0.zw = mul(CurrentOffset0.zw, OffsMat);
     }
-    
-    float4 Result = 0;
-    
+
     BokehSum /= max(WeightSum, 0.0001);
-    
+
     UnpackHDR(BokehSum.rgb);
     UnpackHDR(BokehMax.rgb);
-    
+
+    float BokehBlend = fADOF_BokehIntensity * saturate(CoC * NRings * 2.0);
+    float4 Result;
+
     if (iADOF_BokehMode == 0)
     {
-        Result = lerp(BokehSum, BokehMax, fADOF_BokehIntensity * saturate(CoC * NRings * 2.0));
+        Result = lerp(BokehSum, BokehMax, BokehBlend);
     }
     else if (iADOF_BokehMode == 1)
     {
         float MaxLum = dot(float3(0.3, 0.59, 0.11), BokehMax.rgb);
         float AvgLum = dot(float3(0.3, 0.59, 0.11), BokehSum.rgb);
-        Result = BokehSum * lerp(AvgLum, MaxLum, fADOF_BokehIntensity * saturate(CoC * NRings * 2.0)) / max(AvgLum, 0.0001);
+        Result = BokehSum * lerp(AvgLum, MaxLum, BokehBlend) / max(AvgLum, 0.0001);
     }
     else if (iADOF_BokehMode == 2)
     {
@@ -455,16 +445,16 @@ void PS_DoF_Main(
         BokehWeight *= BokehWeight;
         Result = BokehSum + BokehMax * saturate(BokehWeight * CoC * NRings);
     }
-    else if (iADOF_BokehMode == 3)
+    else
     {
         float MaxLum = dot(float3(0.3, 0.59, 0.11), BokehMax.rgb);
         float AvgLum = dot(float3(0.3, 0.59, 0.11), BokehSum.rgb);
         float BokehWeight = MaxLum - AvgLum;
         Result = lerp(BokehSum, BokehMax, saturate(BokehWeight * CoC * NRings * fADOF_BokehIntensity));
     }
-    
+
     PackHDR(Result.rgb);
-    
+
     OutColor = Result;
 }
 
@@ -479,15 +469,15 @@ void PS_DoF_Combine(
     in float2x2 OffsMat : TEXCOORD2,
     out float4 OutColor : SV_Target0)
 {
-    float4 BlurredColor = ADOF_CommonTexture1.Sample(ADOF_CommonSampler1, TexCoord.xy * fADOF_RenderResolutionMult);
+    float4 BlurredColor = ADOF_CommonTexture1.SampleLevel(ADOF_CommonSampler1, TexCoord.xy * fADOF_RenderResolutionMult, 0);
     float4 OriginalColor = GetSceneColor(TexCoord.xy);
-    
+
     float CoC = abs(CircleOfConfusion(TexCoord.xy, false));
     float BokehRadiusPixels = CoC2BlurRadius(CoC).x * ADOF_BufferSizeAndInvSize.x;
-    
+
     float BlendWeight = saturate((BokehRadiusPixels - DISCRADIUS_RESOLUTION_BOUNDARY_LOWER) / max(DISCRADIUS_RESOLUTION_BOUNDARY_UPPER - DISCRADIUS_RESOLUTION_BOUNDARY_LOWER, 0.0001));
     BlendWeight = pow(max(BlendWeight, 0.0001), DISCRADIUS_RESOLUTION_BOUNDARY_CURVE);
-    
+
     OutColor.rgb = lerp(OriginalColor.rgb, BlurredColor.rgb, BlendWeight);
     OutColor.a = saturate(CoC * GAUSSIAN_BUILDUP_MULT) * 0.5 + 0.5;
 }
@@ -504,31 +494,39 @@ void PS_DoF_Gauss1(
     out float4 OutColor : SV_Target0)
 {
     float2 PixelSize = GetPixelSize();
-    
-    float4 CenterTap = ADOF_CommonTexture0.Sample(ADOF_CommonSampler0, TexCoord.xy);
+
+    float4 CenterTap = ADOF_CommonTexture0.SampleLevel(ADOF_CommonSampler0, TexCoord.xy, 0);
     float CoC = abs(CenterTap.a * 2.0 - 1.0);
-    
-    float NSteps = floor(CoC * fADOF_SmootheningAmount);
+
+    float NSteps = min((float)MAX_GAUSSIAN_STEPS, floor(CoC * fADOF_SmootheningAmount));
+
+    // Early-out for zero blur
+    if (NSteps < 1.0)
+    {
+        OutColor = CenterTap;
+        return;
+    }
+
     float ExpCoeff = -2.0 * rcp(NSteps * NSteps + 1e-3);
-    float2 BlurAxisScaled = float2(1, 0) * PixelSize;
-    
+    float CoCQuarter = CoC * 0.25;
+
     float4 GaussianSum = 0.0;
     float GaussianSumWeight = 1e-3;
-    
+
     for (float iStep = -NSteps; iStep <= NSteps; iStep++)
     {
         float CurrentWeight = exp(iStep * iStep * ExpCoeff);
         float CurrentOffset = 2.0 * iStep - 0.5;
-        
-        float4 CurrentTap = ADOF_CommonTexture0.SampleLevel(ADOF_CommonSampler0, TexCoord.xy + BlurAxisScaled.xy * CurrentOffset, 0);
-        CurrentWeight *= saturate(abs(CurrentTap.a * 2.0 - 1.0) - CoC * 0.25);
-        
+
+        float4 CurrentTap = ADOF_CommonTexture0.SampleLevel(ADOF_CommonSampler0, TexCoord.xy + float2(CurrentOffset * PixelSize.x, 0), 0);
+        CurrentWeight *= saturate(abs(CurrentTap.a * 2.0 - 1.0) - CoCQuarter);
+
         GaussianSum += CurrentTap * CurrentWeight;
         GaussianSumWeight += CurrentWeight;
     }
-    
+
     GaussianSum /= max(GaussianSumWeight, 0.0001);
-    
+
     OutColor.rgb = lerp(CenterTap.rgb, GaussianSum.rgb, saturate(GaussianSumWeight));
     OutColor.a = CenterTap.a;
 }
@@ -544,41 +542,45 @@ void PS_DoF_Gauss2(
     in float2x2 OffsMat : TEXCOORD2,
     out float4 OutColor : SV_Target0)
 {
-    // DEBUG: Output red to confirm shader is running
-    OutColor = float4(1.0, 0.0, 0.0, 1.0);
-    return;
     float2 PixelSize = GetPixelSize();
-    
-    float4 CenterTap = ADOF_CommonTexture1.Sample(ADOF_CommonSampler1, TexCoord.xy);
+
+    float4 CenterTap = ADOF_CommonTexture1.SampleLevel(ADOF_CommonSampler1, TexCoord.xy, 0);
     float CoC = abs(CenterTap.a * 2.0 - 1.0);
-    
-    float NSteps = min(50, floor(CoC * fADOF_SmootheningAmount));
+
+    float NSteps = min((float)MAX_GAUSSIAN_STEPS, floor(CoC * fADOF_SmootheningAmount));
+
+    if (NSteps < 1.0)
+    {
+        OutColor = CenterTap;
+        return;
+    }
+
     float ExpCoeff = -2.0 * rcp(NSteps * NSteps + 1e-3);
-    float2 BlurAxisScaled = float2(0, 1) * PixelSize;
-    
+    float CoCQuarter = CoC * 0.25;
+
     float4 GaussianSum = 0.0;
     float GaussianSumWeight = 1e-3;
-    
+
     for (float iStep = -NSteps; iStep <= NSteps; iStep++)
     {
         float CurrentWeight = exp(iStep * iStep * ExpCoeff);
         float CurrentOffset = 2.0 * iStep - 0.5;
-        
-        float4 CurrentTap = ADOF_CommonTexture1.SampleLevel(ADOF_CommonSampler1, TexCoord.xy + BlurAxisScaled.xy * CurrentOffset, 0);
-        CurrentWeight *= saturate(abs(CurrentTap.a * 2.0 - 1.0) - CoC * 0.25);
-        
+
+        float4 CurrentTap = ADOF_CommonTexture1.SampleLevel(ADOF_CommonSampler1, TexCoord.xy + float2(0, CurrentOffset * PixelSize.y), 0);
+        CurrentWeight *= saturate(abs(CurrentTap.a * 2.0 - 1.0) - CoCQuarter);
+
         GaussianSum += CurrentTap * CurrentWeight;
         GaussianSumWeight += CurrentWeight;
     }
-    
+
     GaussianSum /= max(GaussianSumWeight, 0.0001);
-    
+
     OutColor.rgb = lerp(CenterTap.rgb, GaussianSum.rgb, saturate(GaussianSumWeight));
     OutColor.a = CenterTap.a;
 }
 
 //=============================================================================
-// Chromatic Aberration
+// Chromatic Aberration — use SampleLevel for consistency
 //=============================================================================
 
 void PS_DoF_ChromaticAberration(
@@ -589,40 +591,48 @@ void PS_DoF_ChromaticAberration(
     out float4 OutColor : SV_Target0)
 {
     float2 PixelSize = GetPixelSize();
-    float3 NeighbourOffsets = float3(PixelSize, 0);
-    
-    float4 ColorVals[5];
-    ColorVals[0] = ADOF_CommonTexture0.Sample(ADOF_CommonSampler0, TexCoord.xy);
-    ColorVals[1] = ADOF_CommonTexture0.Sample(ADOF_CommonSampler0, TexCoord.xy - NeighbourOffsets.xz);
-    ColorVals[2] = ADOF_CommonTexture0.Sample(ADOF_CommonSampler0, TexCoord.xy - NeighbourOffsets.zy);
-    ColorVals[3] = ADOF_CommonTexture0.Sample(ADOF_CommonSampler0, TexCoord.xy + NeighbourOffsets.xz);
-    ColorVals[4] = ADOF_CommonTexture0.Sample(ADOF_CommonSampler0, TexCoord.xy + NeighbourOffsets.zy);
-    
-    float CoC = abs(ColorVals[0].a * 2.0 - 1.0);
+
+    float4 Center = ADOF_CommonTexture0.SampleLevel(ADOF_CommonSampler0, TexCoord.xy, 0);
+
+    float CoC = abs(Center.a * 2.0 - 1.0);
+
+    // Early-out when no chromatic shift needed
+    if (CoC < COC_SKIP_THRESHOLD)
+    {
+        OutColor = float4(Center.rgb, 1.0);
+        return;
+    }
+
     float2 BokehRadiusScaled = CoC2BlurRadius(CoC);
-    
+
+    float2 Ox = float2(PixelSize.x, 0);
+    float2 Oy = float2(0, PixelSize.y);
+
+    float4 C1 = ADOF_CommonTexture0.SampleLevel(ADOF_CommonSampler0, TexCoord.xy - Ox, 0);
+    float4 C2 = ADOF_CommonTexture0.SampleLevel(ADOF_CommonSampler0, TexCoord.xy - Oy, 0);
+    float4 C3 = ADOF_CommonTexture0.SampleLevel(ADOF_CommonSampler0, TexCoord.xy + Ox, 0);
+    float4 C4 = ADOF_CommonTexture0.SampleLevel(ADOF_CommonSampler0, TexCoord.xy + Oy, 0);
+
     float4 VGradTwosided = float4(
-        dot(ColorVals[0].rgb - ColorVals[1].rgb, 1),
-        dot(ColorVals[0].rgb - ColorVals[2].rgb, 1),
-        dot(ColorVals[3].rgb - ColorVals[0].rgb, 1),
-        dot(ColorVals[4].rgb - ColorVals[0].rgb, 1)
+        dot(Center.rgb - C1.rgb, 1),
+        dot(Center.rgb - C2.rgb, 1),
+        dot(C3.rgb - Center.rgb, 1),
+        dot(C4.rgb - Center.rgb, 1)
     );
-    
+
     float2 VGrad = min(VGradTwosided.xy, VGradTwosided.zw);
-    
-    float VGradLen = sqrt(dot(VGrad, VGrad)) + 1e-6;
+    float VGradLen = length(VGrad) + 1e-6;
     VGrad = VGrad / VGradLen * saturate(VGradLen * 32.0) * BokehRadiusScaled * 0.125 * fADOF_ShapeChromaAmount;
-    
-    float4 ChromaVals[3];
-    ChromaVals[0] = ColorVals[0];
-    ChromaVals[1] = ADOF_CommonTexture0.Sample(ADOF_CommonSampler0, TexCoord.xy + VGrad);
-    ChromaVals[2] = ADOF_CommonTexture0.Sample(ADOF_CommonSampler0, TexCoord.xy - VGrad);
-    
-    ChromaVals[1].rgb = lerp(ChromaVals[0].rgb, ChromaVals[1].rgb, saturate(4.0 * abs(ChromaVals[1].w)));
-    ChromaVals[2].rgb = lerp(ChromaVals[0].rgb, ChromaVals[2].rgb, saturate(4.0 * abs(ChromaVals[2].w)));
-    
-    uint3 ChromaMode = (uint3(0, 1, 2) + uint3(iADOF_ShapeChromaMode, iADOF_ShapeChromaMode, iADOF_ShapeChromaMode)) % 3;
-    
+
+    float4 ChromaPos = ADOF_CommonTexture0.SampleLevel(ADOF_CommonSampler0, TexCoord.xy + VGrad, 0);
+    float4 ChromaNeg = ADOF_CommonTexture0.SampleLevel(ADOF_CommonSampler0, TexCoord.xy - VGrad, 0);
+
+    ChromaPos.rgb = lerp(Center.rgb, ChromaPos.rgb, saturate(4.0 * abs(ChromaPos.w)));
+    ChromaNeg.rgb = lerp(Center.rgb, ChromaNeg.rgb, saturate(4.0 * abs(ChromaNeg.w)));
+
+    float4 ChromaVals[3] = { Center, ChromaPos, ChromaNeg };
+    uint3 ChromaMode = (uint3(0, 1, 2) + (uint3)iADOF_ShapeChromaMode) % 3;
+
     OutColor.rgb = float3(
         ChromaVals[ChromaMode.x].r,
         ChromaVals[ChromaMode.y].g,
